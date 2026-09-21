@@ -1,0 +1,57 @@
+{
+  "name": "a4-a5-printer",
+  "version": "4.1.0",
+  "description": "Nhận PDF hoặc HTML từ HIS, xem trước và xác nhận trước khi in",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis",
+    "dist:win:publish": "electron-builder --win nsis --publish always",
+    "portable": "electron-builder --win portable --config.win.artifactName=A4-A5-Printer-Portable-${version}-${arch}.${ext}"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "electron-updater": "6.6.2",
+    "express": "^5.1.0",
+    "multer": "2.0.2",
+    "pdf-lib": "1.17.1",
+    "pdf-to-printer": "5.8.0"
+  },
+  "devDependencies": {
+    "electron": "35.7.5",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "vn.print.a4a5",
+    "productName": "A4 A5 Printer",
+	"publish": [
+      {
+        "provider": "github",
+        "owner": "trongdqtgg",
+        "repo": "trinhduyet_release",
+        "releaseType": "release"
+      }
+    ],
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/pdf-to-printer/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "A4-A5-Printer-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true
+    }
+  }
+}
