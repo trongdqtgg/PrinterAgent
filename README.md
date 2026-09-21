@@ -1,4 +1,6 @@
-# A4 ↔ A5 Printer
+# HIS Print Preview Pro v4.11.0
+
+Giao diện VNPT xanh dương–trắng; logo VNPT chỉ dùng làm icon ứng dụng và khay hệ thống. Form luôn khởi động ở chế độ kiosk toàn màn hình, không có thanh tiêu đề hoặc các nút Windows. Khi HIS gọi hoặc mở lại từ khay hệ thống, chế độ kiosk được tự động kích hoạt lại. F3/F4 điều chỉnh tỷ lệ ±3%, tự tạo lại bản xem trước và mở nút **In ngay** sau khi hoàn tất.
 
 Phiên bản hiện tại: **2.13.0**.
 

@@ -46,7 +46,7 @@ async function reflowPdf(sourceBytes,{landscape,pageSize,scaleFactor}) {
 
 function selectedPageIndices(total,selection={}) {
   const all=Array.from({length:total},(_,i)=>i),mode=selection.mode||'all';
-  if(mode==='odd')return all.filter(i=>i%2===0);if(mode==='even')return all.filter(i=>i%2===1);if(mode!=='custom')return all;
+  if(mode==='odd')return all.filter(i=>i%2===0).reverse();if(mode==='even')return all.filter(i=>i%2===1);if(mode!=='custom')return all;
   const chosen=new Set();for(const token of String(selection.customRange||'').split(',').map(x=>x.trim()).filter(Boolean)){const match=token.match(/^(\d+)\s*-\s*(\d+)$/);if(match){let a=Number(match[1]),b=Number(match[2]);if(a>b)[a,b]=[b,a];for(let p=a;p<=b;p++)if(p>=1&&p<=total)chosen.add(p-1);}else if(/^\d+$/.test(token)){const p=Number(token);if(p>=1&&p<=total)chosen.add(p-1);}}
   return [...chosen].sort((a,b)=>a-b);
 }
@@ -79,12 +79,22 @@ async function warmPrintEngine() {
 }
 
 function createWindow() {
+  const appIcon = path.join(__dirname, 'assets', 'logo-vnpt.png');
   mainWindow = new BrowserWindow({
     width: 980, height: 720, minWidth: 820, minHeight: 620,
-    title: 'A4 ↔ A5 Printer',
+    title: 'HIS Print Preview Pro',
+    icon: appIcon,
+    frame: false,
+    kiosk: true,
+    minimizable: false,
+    maximizable: false,
+    closable: false,
+    alwaysOnTop: true,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false }
   });
   mainWindow.setMenuBarVisibility(false);
+  mainWindow.setKiosk(true);
+  mainWindow.setAlwaysOnTop(true, 'screen-saver');
   mainWindow.loadURL(`http://${LOCAL_HOST}:${LOCAL_PORT}`);
   mainWindow.on('close', event => {
     if (isQuitting) return;
@@ -116,14 +126,15 @@ function showMainWindow() {
     return;
   }
   if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isKiosk()) mainWindow.setKiosk(true);
+  mainWindow.setAlwaysOnTop(true, 'screen-saver');
   mainWindow.show();
   mainWindow.focus();
 }
 
 function createTray() {
   if (tray || process.platform !== 'win32') return;
-  const trayPng = 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAwklEQVR42u1XWxJAMAzUTO/AX12PA3E9/uoUfJnxCFLSxCt/1XZ2k2w6NkmUw2xtpEXTcwJ1dW5IBLiBj4iAJDiGAZLgGBZoixCks19WwVIO+8rN1lnZot+ne0FjuFcBDIQSFCJdnZtoGqASVxehPXsRK/Eya1+5w1YAZ39DBXifd4BLYGcmxsZUOaUlz2wB10N0icDeJIRMg5XI8psa+Am8hwCmdA71r3yB9H/h6A/u04It6xTbHQHFv8W0ZurmVD0G/UVMUDuQKzEAAAAASUVORK5CYII=';
-  const icon = nativeImage.createFromDataURL(`data:image/png;base64,${trayPng}`).resize({width:20,height:20});
+  const icon = nativeImage.createFromPath(path.join(__dirname, 'assets', 'logo-vnpt.png')).resize({width:20,height:20});
   tray = new Tray(icon);
   tray.setToolTip(`A4 A5 Printer v${app.getVersion()} · API 127.0.0.1:${LOCAL_PORT}`);
   tray.setContextMenu(Menu.buildFromTemplate([
@@ -142,9 +153,8 @@ function configureWindowsAutoStart() {
   try {
     app.setLoginItemSettings({
       openAtLogin: true,
-      enabled: true,
       path: process.execPath,
-      args: []
+      args: ['--autostart']
     });
   } catch (error) {
     console.warn(`Không cấu hình được tự khởi động cùng Windows: ${error.message}`);
@@ -295,12 +305,17 @@ function enqueuePrintJob(options,metadata,existingJob=null) {
     } finally {
       job.finishedAt=new Date().toISOString();
       if (job.previewPath && job.previewPath !== job.filePath) { try { await fs.unlink(job.previewPath); } catch {} }
-      if (!job.localFile) { try { await fs.unlink(job.filePath); } catch {} }
-      const cleanup=setTimeout(()=>printJobs.delete(jobId),60*60*1000);
-      cleanup.unref();
+      job.previewPath=null;
+      job.previewReady=false;
+      if (job.status === 'success') { job.status='awaiting_preview'; job.message='Đã in xong; có thể xem trước và in tiếp'; }
+      if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
+      job.cleanupTimer=setTimeout(async()=>{if(!job.localFile){try{await fs.unlink(job.filePath);}catch{}}printJobs.delete(jobId);},60*60*1000);
+      job.cleanupTimer.unref();
     }
   };
-  printQueue=printQueue.then(run,run);
+  const task=printQueue.then(run,run);
+  printQueue=task;
+  job.completion=task.then(()=>publicPrintJob(job));
   return job;
 }
 
@@ -334,7 +349,8 @@ ipcMain.handle('generate-job-preview', async (_event, request) => {
   const jobId=typeof request==='string'?request:request.jobId;
   const settings=typeof request==='string'?{}:(request.settings||{});
   const job=printJobs.get(jobId);
-  if (!job || !['awaiting_preview','awaiting_confirmation'].includes(job.status)) throw new Error('Tài liệu không còn hiệu lực');
+  if (!job || !['awaiting_preview','awaiting_confirmation','success'].includes(job.status)) throw new Error('Tài liệu không còn hiệu lực');
+  if (job.cleanupTimer) { clearTimeout(job.cleanupTimer); job.cleanupTimer=null; }
   if (job.previewPath && job.previewPath !== job.filePath) { try { await fs.unlink(job.previewPath); } catch {} }
   const bytes=await buildPreviewPdf(job.filePath,settings);
   job.previewPath=path.join(app.getPath('temp'),`his-preview-${crypto.randomUUID()}.pdf`);
@@ -344,12 +360,22 @@ ipcMain.handle('generate-job-preview', async (_event, request) => {
   job.previewReady=true; job.status='awaiting_confirmation'; job.message='Đã tạo bản xem trước; đang chờ xác nhận in';
   return {...publicPrintJob(job),previewUrl:`/api/preview/${job.jobId}?v=${Date.now()}`};
 });
-ipcMain.handle('confirm-preview', (_event, options) => {
+ipcMain.handle('confirm-preview', async (_event, options) => {
   const job=printJobs.get(options.jobId);
   if (!job || job.status !== 'awaiting_confirmation' || !job.previewReady || !job.previewPath) throw new Error('Phải tạo và kiểm tra bản xem trước trước khi in');
   if (String(options.signature||'') !== String(job.previewSignature||'')) throw new Error('Cấu hình đã thay đổi; vui lòng xem trước lại');
   enqueuePrintJob({filePath:job.previewPath,deviceName:options.deviceName||job.deviceName,copies:Number(options.copies)||job.copies||1},{deviceName:options.deviceName||job.deviceName,copies:Number(options.copies)||job.copies||1,originalName:job.originalName,localFile:job.localFile,sourceFilePath:job.filePath},job);
-  return publicPrintJob(job);
+  return await job.completion;
+});
+ipcMain.handle('exit-form', () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide(); return {ok:true}; });
+ipcMain.handle('export-preview-pdf', async (_event, jobId) => {
+  const job=printJobs.get(jobId);
+  if (!job || !job.previewReady || !job.previewPath) throw new Error('Hãy tạo bản xem trước trước khi xuất PDF');
+  const baseName=path.parse(job.originalName || 'tai-lieu').name.replace(/[<>:"/\\|?*\x00-\x1F]/g,'_');
+  const result=await dialog.showSaveDialog(mainWindow,{title:'Xuất bản PDF đã xem trước',defaultPath:path.join(app.getPath('documents'),`${baseName}-preview.pdf`),filters:[{name:'PDF',extensions:['pdf']}]});
+  if (result.canceled || !result.filePath) return {ok:false,canceled:true};
+  await fs.copyFile(job.previewPath,result.filePath);
+  return {ok:true,filePath:result.filePath};
 });
 ipcMain.handle('cancel-preview', async (_event, jobId) => {
   const job=printJobs.get(jobId);
