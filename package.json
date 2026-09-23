@@ -1,7 +1,7 @@
 {
   "name": "a4-a5-printer",
-  "version": "4.11.0",
-  "description": "Nhận PDF hoặc HTML từ HIS, xem trước và xác nhận trước khi in",
+  "version": "4.18.6",
+  "description": "Nhận PDF hoặc HTML từ HIS, xem trước và xác nhận trước khi in; tích hợp quét vân tay ZK và Scan mobile",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
@@ -10,12 +10,18 @@
     "portable": "electron-builder --win portable --config.win.artifactName=A4-A5-Printer-Portable-${version}-${arch}.${ext}"
   },
   "dependencies": {
+    "body-parser": "2.3.0",
+    "cloudflared": "0.7.3",
     "cors": "^2.8.6",
+    "electron-log": "5.4.4",
     "electron-updater": "6.6.2",
     "express": "^5.1.0",
+    "koffi": "2.16.3",
     "multer": "2.0.2",
     "pdf-lib": "1.17.1",
-    "pdf-to-printer": "5.8.0"
+    "pdf-to-printer": "5.8.0",
+    "pdfkit": "0.20.2",
+    "pngjs": "7.0.0"
   },
   "devDependencies": {
     "electron": "35.7.5",
@@ -24,7 +30,7 @@
   "build": {
     "appId": "vn.print.a4a5",
     "productName": "A4 A5 Printer",
-	"publish": [
+    "publish": [
       {
         "provider": "github",
         "owner": "trongdqtgg",
@@ -34,12 +40,24 @@
     ],
     "files": [
       "src/**/*",
-      "package.json"
+      "package.json",
+      "!src/fingerprint/native/**",
+      "!node_modules/koffi/build/koffi/darwin_*/**",
+      "!node_modules/koffi/build/koffi/linux_*/**",
+      "!node_modules/koffi/build/koffi/musl_*/**",
+      "!node_modules/koffi/build/koffi/freebsd_*/**",
+      "!node_modules/koffi/build/koffi/openbsd_*/**",
+      "!node_modules/koffi/src/**",
+      "!node_modules/koffi/vendor/**",
+      "!node_modules/koffi/doc/**"
     ],
     "asarUnpack": [
-      "node_modules/pdf-to-printer/**/*"
+      "node_modules/pdf-to-printer/**/*",
+      "node_modules/koffi/**/*",
+      "node_modules/cloudflared/bin/**/*"
     ],
     "win": {
+      "requestedExecutionLevel": "asInvoker",
       "icon": "src/assets/logo-vnpt.png",
       "target": [
         "nsis",
@@ -53,6 +71,12 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "runAfterFinish": true
-    }
+    },
+    "extraResources": [
+      {
+        "from": "src/fingerprint/native",
+        "to": "native"
+      }
+    ]
   }
 }

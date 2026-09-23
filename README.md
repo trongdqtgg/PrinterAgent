@@ -1,6 +1,24 @@
-# HIS Print Preview Pro v4.11.0
+# HIS Print Preview Pro v4.16.0
 
 Giao diện VNPT xanh dương–trắng; logo VNPT chỉ dùng làm icon ứng dụng và khay hệ thống. Form luôn khởi động ở chế độ kiosk toàn màn hình, không có thanh tiêu đề hoặc các nút Windows. Khi HIS gọi hoặc mở lại từ khay hệ thống, chế độ kiosk được tự động kích hoạt lại. F3/F4 điều chỉnh tỷ lệ ±3%, tự tạo lại bản xem trước và mở nút **In ngay** sau khi hoàn tất.
+
+Source được rollback từ v4.11.0. Mỗi tài liệu mới được thêm vào form sẽ tự động kích hoạt Xem trước (tương đương F1) đúng một lần; ứng dụng không tự chọn hoặc thay đổi mẫu cấu hình.
+
+Tỷ lệ mặc định khi nhận tài liệu là 95%. Khi chọn Tất cả trang, ứng dụng kiểm tra khả năng duplex từ driver Windows: máy tương thích tự chọn hai mặt lật cạnh dài; nếu driver không hỗ trợ hoặc không xác định được, form hiển thị cảnh báo nhưng vẫn cho phép người dùng chọn để driver xử lý.
+
+Sau khi in Trang lẻ thành công, form tự chuyển sang Trang chẵn và tự tạo preview để người dùng lật giấy rồi in tiếp. Danh sách In hai mặt luôn mở; kiểm tra driver chỉ hiển thị trạng thái tương thích và không khóa lựa chọn.
+
+Đã sửa lỗi chuyển sang preview Trang chẵn quá sớm: giao diện hiện chờ đúng tác vụ in trong hàng đợi hoàn tất và job trở lại trạng thái chờ preview rồi mới tạo bản xem trước tiếp theo.
+
+Vùng thông báo trạng thái được chuyển lên ngay dưới tiêu đề Khung xem trước tài liệu, sát phía trên phiếu để dễ quan sát thông báo in xong, tiến trình và lỗi.
+
+Menu chuột phải ở khay hệ thống có thêm In qua LAN với ba trạng thái Tắt, Client và Server. Chế độ Server lắng nghe TCP RAW trên cổng 9100 và hiển thị IP LAN; chuyển sang Client tự dừng Server. Chế độ được ghi nhớ cho lần khởi động tiếp theo.
+
+Chế độ Client có cửa sổ nhập IP Server. Ứng dụng tự tạo hoặc cập nhật cổng TCP RAW 9100, cài một máy in cố định tên LAN_Virtual_Printer, tránh tạo bản sao trùng và đặt làm máy in mặc định. Luồng cài máy in LAN không dùng PowerShell; nó sử dụng cmd.exe, cscript, prnport.vbs, prnmngr.vbs và PrintUIEntry có sẵn của Windows. Windows chỉ hiển thị UAC khi cài hoặc thay đổi máy in ảo.
+
+Chế độ Server giữ logic từ LANPrint: mở Firewall TCP 9100, lắng nghe trên 0.0.0.0, tự dò và giải phóng tiến trình chiếm cổng khi gặp EADDRINUSE, nhận dữ liệu RAW thành file PRN rồi gửi ra máy in vật lý mặc định. Menu taskbar có thêm thao tác giải phóng và chiếm lại cổng 9100.
+
+Bản 4.17.1 ưu tiên mở TCP listener ngay như lanprint232323, không chờ thao tác Firewall/UAC. Dữ liệu socket được gom đến sự kiện end, ghi đồng bộ vào thư mục virtual-print-output trong dữ liệu ứng dụng, sau đó gọi pdf-to-printer theo đúng logic Server mẫu.
 
 Phiên bản hiện tại: **2.13.0**.
 
@@ -19,7 +37,9 @@ Phiên bản hiện tại: **2.13.0**.
 - Tự kiểm tra, tải và cài phiên bản mới khi chạy bản `.exe`.
 - Bản đã cài đặt tự khởi động cùng Windows để API in tại `127.0.0.1:5756` luôn sẵn sàng.
 - Khi đóng cửa sổ, ứng dụng tiếp tục chạy trong khay hệ thống để Web Print API không bị ngắt; menu khay cho phép mở lại, kiểm tra cập nhật hoặc thoát hoàn toàn.
-- Bản `.exe` tự kiểm tra cập nhật một lần khi khởi động; người dùng có thể chủ động kiểm tra từ giao diện hoặc menu khay hệ thống.
+- Bản `.exe` tự kiểm tra cập nhật **ngầm** khi khởi động và định kỳ mỗi 6 giờ. Khi bấm **Kiểm tra cập nhật** (form, menu khay hoặc `POST /api/update`), form in được đóng lại và việc kiểm tra/tải chạy nền; tiến trình được báo bằng thông báo ở khay hệ thống.
+- Bản cập nhật tải xong sẽ tự cài im lặng và mở lại agent khi form in đang đóng và không có lệnh in đang chạy; nếu người dùng đang thao tác, việc cài đặt được hoãn tới khi đóng form. Không còn hộp thoại hỏi cập nhật đè lên form kiosk.
+- Tự phục hồi form trắng: khi renderer bị crash/treo, trang nạp lỗi, GPU reset hoặc máy vừa thức dậy từ sleep, form tự nạp lại và nhận lại tài liệu HIS đang chờ. Mỗi lần mở form đều kiểm tra các nút thao tác; nếu thiếu sẽ nạp lại ngay. Tăng tốc phần cứng mặc định tắt để tránh lỗi driver đồ họa (đặt biến môi trường `A4A5_ENABLE_GPU=1` để bật lại).
 - Web Print Controller trên localhost port `5756`.
 - REST API kiểm tra dịch vụ, đọc danh sách máy in và gửi PDF để in.
 - Không yêu cầu người dùng khai báo khổ hoặc chiều của tài liệu nguồn.
@@ -196,3 +216,17 @@ Web thuần chỉ dùng được hộp thoại `window.print()` và không đư�
 ## Lưu ý driver
 
 Máy in phải được cài driver và nhìn thấy trong **Settings > Bluetooth & devices > Printers & scanners**. Một số driver khóa khổ giấy tại Printer Properties; hãy bật A4/A5 trong **Printing Preferences**. Chương trình đặt kích thước trang đích, còn khả năng nạp giấy/khay giấy phụ thuộc driver và máy in.
+
+## Tính năng tích hợp trên khay hệ thống (v4.18.0)
+
+Menu chuột phải biểu tượng A4 A5 Printer ở khay hệ thống có thêm:
+
+- **📱 Scan mobile (chụp ảnh từ điện thoại)**: mở cửa sổ QR, điện thoại quét mã để gửi ảnh về máy, xoay/xóa ảnh và xuất PDF có dấu "SAO Y BẢN CHÍNH". Server cổng `3000` và Cloudflare Tunnel chỉ khởi động ở lần mở đầu tiên. Đóng cửa sổ chỉ ẩn xuống, danh sách ảnh và link QR được giữ nguyên. Code gốc nằm ở `src/scan-mobile/` (giữ nguyên phần upload, xử lý ảnh, xuất PDF; chỉ đổi phần khởi động/cửa sổ).
+- **👆 Quét vân tay**: dịch vụ ZK9500/ZK4500 chạy nền cùng PrintAgent, API giữ nguyên tại `http://127.0.0.1:18622` (`/api/finger/check-connection`, `/api/finger/send-scan`, `/api/finger/status`). Menu con có trạng thái máy quét, kiểm tra kết nối, chọn nguồn vân tay (máy thật / dán ảnh thủ công) và khởi động lại dịch vụ. Code gốc nằm nguyên vẹn ở `src/fingerprint/src/`; `src/fingerprint/index.js` thay cho `electron-main.js` cũ (không tạo tray riêng, không đăng ký khởi động riêng).
+
+Lưu ý khi triển khai:
+
+- **Gỡ cài đặt ứng dụng "ZK Fingerprint Kiosk" và tắt app Scan mobile cũ** trên máy trạm, nếu không cổng 18622/3000 sẽ bị chiếm. PrintAgent vẫn chạy bình thường, menu sẽ báo lỗi cổng.
+- DLL ZKFinger SDK đặt trong `src/fingerprint/native/x64` và `x86`; khi build được copy ra `resources/native`. Test không có máy quét: đặt biến môi trường `MOCK_FINGERPRINT=1`.
+- Build bằng `npm ci`/`npm install` **có chạy script** (không dùng `--ignore-scripts`) để `cloudflared` tải file `cloudflared.exe`. Nếu thiếu, ứng dụng tự tải về thư mục dữ liệu ở lần mở Scan mobile đầu tiên.
+- Không tự cài bản cập nhật khi đang in, đang chờ quét vân tay hoặc đang mở cửa sổ Scan mobile.

@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ứng dụng Scan & Xuất PDF</title>
+    <!-- Sử dụng thư viện QRCode.js để vẽ mã QR (đóng gói sẵn trong app, không cần internet/cdnjs) -->
+    <script src="vendor/qrcode.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { background-color: #f0f2f5; color: #333; display: flex; height: 100vh; overflow: hidden; }
+
+        /* Sidebar bên trái: Thông tin QR và điều khiển */
+        .sidebar { width: 320px; background: #ffffff; border-right: 1px solid #ddd; padding: 20px; display: flex; flex-direction: column; align-items: center; box-shadow: 2px 0 5px rgba(0,0,0,0.05); }
+        .sidebar h2 { font-size: 18px; margin-bottom: 15px; color: #007bff; text-align: center; }
+        
+        #qrcode { background: white; padding: 10px; border: 1px solid #eee; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        
+        .url-box { width: 100%; word-break: break-all; font-size: 12px; background: #f8f9fa; padding: 8px; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 15px; text-align: center; color: #555; max-height: 60px; overflow-y: auto; }
+
+        .sidebar button { width: 100%; padding: 12px; margin-bottom: 10px; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+        
+        #btn-renew { background: #17a2b8; color: white; }
+        #btn-renew:hover { background: #138496; }
+
+        #btn-export { background: #28a745; color: white; }
+        #btn-export:hover { background: #218838; }
+
+        #btn-reset { background: #dc3545; color: white; }
+        #btn-reset:hover { background: #c82333; }
+
+        /* Khu vực chính bên phải: Danh sách ảnh */
+        .main-content { flex: 1; padding: 20px; display: flex; flex-direction: column; overflow-y: auto; }
+        .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid #ddd; padding-bottom: 10px; }
+        .header-bar h1 { font-size: 20px; color: #333; }
+        
+        .image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 15px; padding-bottom: 20px; }
+        
+        .image-card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 10px; display: flex; flex-direction: column; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); position: relative; }
+        .image-card img { width: 100%; height: 150px; object-fit: cover; border-radius: 4px; margin-bottom: 10px; background: #000; }
+        
+        .card-actions { display: flex; gap: 5px; width: 100%; }
+        .card-actions button { flex: 1; padding: 6px; font-size: 12px; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
+        .btn-rotate { background: #ffc107; color: #333; }
+        .btn-rotate:hover { background: #e0a800; }
+        .btn-delete { background: #dc3545; color: white; }
+        .btn-delete:hover { background: #c82333; }
+
+        .empty-notice { text-align: center; color: #888; margin-top: 50px; font-size: 16px; width: 100%; grid-column: 1 / -1; }
+    </style>
+</head>
+<body>
+
+    <!-- Sidebar điều khiển -->
+    <div class="sidebar">
+        <h2>Quét mã để chụp ảnh</h2>
+        <div id="qrcode"></div>
+        <div class="url-box" id="url-display">Đang tạo link kết nối...</div>
+        
+        <button id="btn-renew" onclick="regenerateQR()">🔄 Tạo mới QR Link</button>
+        <button id="btn-export" onclick="exportPDF()">📄 Xuất ra File PDF</button>
+        <button id="btn-reset" onclick="resetAll()">🗑️ Xóa tất cả ảnh</button>
+    </div>
+
+    <!-- Khu vực hiển thị ảnh thu thập -->
+    <div class="main-content">
+        <div class="header-bar">
+            <h1>Danh sách ảnh đã chụp (<span id="image-count">0</span>)</h1>
+        </div>
+        <div class="image-grid" id="image-grid">
+            <div class="empty-notice">Chưa có ảnh nào được gửi lên. Hãy dùng điện thoại quét mã QR bên trái để chụp ảnh!</div>
+        </div>
+    </div>
+
+    <script>
+        const { ipcRenderer } = require('electron');
+        const fs = require('fs');
+
+        let imagePaths = [];
+        let qrCodeInstance = null;
+
+        // Khởi tạo khung chứa QR code ban đầu
+        window.addEventListener('DOMContentLoaded', () => {
+            qrCodeInstance = new QRCode(document.getElementById("qrcode"), {
+                text: "Waiting for tunnel...",
+                width: 150,
+                height: 150
+            });
+        });
+
+        // Nhận URL Cloudflare từ main process
+        ipcRenderer.on('tunnel-url', (event, url) => {
+            document.getElementById('url-display').innerText = url;
+            if (qrCodeInstance) {
+                qrCodeInstance.clear();
+                qrCodeInstance.makeCode(url);
+            }
+        });
+
+        // Nhận ảnh mới gửi từ điện thoại qua server
+        ipcRenderer.on('image-received', (event, filePath) => {
+            imagePaths.push(filePath);
+            renderImages();
+        });
+
+        // Hiển thị danh sách ảnh ra giao diện lưới
+        function renderImages() {
+            const grid = document.getElementById('image-grid');
+            document.getElementById('image-count').innerText = imagePaths.length;
+            
+            if (imagePaths.length === 0) {
+                grid.innerHTML = '<div class="empty-notice">Chưa có ảnh nào được gửi lên. Hãy dùng điện thoại quét mã QR bên trái để chụp ảnh!</div>';
+                return;
+            }
+
+            grid.innerHTML = '';
+            imagePaths.forEach((imgPath, index) => {
+                if (fs.existsSync(imgPath)) {
+                    // Đọc file ảnh dưới dạng base64 để hiển thị an toàn trên giao diện Electron
+                    const bitmap = fs.readFileSync(imgPath);
+                    const base64Image = Buffer.from(bitmap).toString('base64');
+                    const imgSrc = `data:image/jpeg;base64,${base64Image}`;
+
+                    const card = document.createElement('div');
+                    card.className = 'image-card';
+                    card.innerHTML = `
+                        <img id="img-${index}" src="${imgSrc}" alt="Ảnh ${index + 1}">
+                        <div class="card-actions">
+                            <button class="btn-rotate" onclick="rotateImage(${index})">🔄 Xoay</button>
+                            <button class="btn-delete" onclick="deleteImage(${index})">❌ Xóa</button>
+                        </div>
+                    `;
+                    grid.appendChild(card);
+                }
+            });
+        }
+
+        // Xóa một ảnh
+        async function deleteImage(index) {
+            const filePath = imagePaths[index];
+            const res = await ipcRenderer.invoke('delete-image', filePath);
+            if (res.success) {
+                imagePaths.splice(index, 1);
+                renderImages();
+            }
+        }
+
+        // Xoay ảnh 90 độ theo chiều kim đồng hồ
+        function rotateImage(index) {
+            const imgPath = imagePaths[index];
+            const imgElement = document.getElementById(`img-${index}`);
+            
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const img = new Image();
+            
+            img.onload = () => {
+                canvas.width = img.height;
+                canvas.height = img.width;
+                
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.translate(canvas.width / 2, canvas.height / 2);
+                ctx.rotate(90 * Math.PI / 180);
+                ctx.drawImage(img, -img.width / 2, -img.height / 2);
+                
+                const dataURL = canvas.toDataURL('image/jpeg');
+                imgElement.src = dataURL;
+                
+                // Gửi dữ liệu ảnh đã xoay lưu đè vào file gốc
+                ipcRenderer.invoke('save-rotated-image', imgPath, dataURL);
+            };
+            img.src = imgElement.src;
+        }
+
+        // Tạo mới QR link
+        async function regenerateQR() {
+            const btn = document.getElementById('btn-renew');
+            btn.innerText = 'Đang tạo...';
+            btn.disabled = true;
+            
+            await ipcRenderer.invoke('regenerate-qr');
+            
+            setTimeout(() => {
+                btn.innerText = '🔄 Tạo mới QR Link';
+                btn.disabled = false;
+            }, 3000);
+        }
+
+        // Xuất PDF và tự động copy path
+        async function exportPDF() {
+            if (imagePaths.length === 0) {
+                alert('Không có ảnh nào để xuất PDF!');
+                return;
+            }
+
+            const res = await ipcRenderer.invoke('export-to-pdf', imagePaths);
+            if (res.success) {
+                alert(`Xuất file PDF thành công!\nĐường dẫn đã được tự động copy vào clipboard:\n${res.filePath}`);
+            } else if (res.message !== 'Đã hủy lưu file.') {
+                alert('Lỗi xuất PDF: ' + res.message);
+            }
+        }
+
+        // Xóa tất cả ảnh
+        async function resetAll() {
+            if (confirm('Bạn có chắc chắn muốn xóa toàn bộ danh sách ảnh hiện tại không?')) {
+                await ipcRenderer.invoke('reset-all');
+                imagePaths = [];
+                renderImages();
+            }
+        }
+    </script>
+</body>
+</html>

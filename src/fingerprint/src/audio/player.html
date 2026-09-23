@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>audio-player</title></head>
+<body>
+<audio id="player"></audio>
+<script>
+  const { ipcRenderer } = require('electron');
+  ipcRenderer.on('play', (event, filePath) => {
+    const el = document.getElementById('player');
+    el.src = 'file://' + filePath;
+    el.play().catch(() => {});
+  });
+</script>
+</body>
+</html>

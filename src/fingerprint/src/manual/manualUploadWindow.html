@@ -1,0 +1,123 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Dán ảnh vân tay thủ công</title>
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 13px; padding: 16px; color: #222; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  .warn {
+    background: #fff3cd; border: 1px solid #ffe08a; padding: 10px;
+    border-radius: 4px; margin-bottom: 14px; line-height: 1.5;
+  }
+  .warn code { background: #f5eac7; padding: 1px 4px; border-radius: 3px; }
+  label { display: block; margin-top: 12px; font-weight: 600; }
+  input[type="text"], textarea {
+    width: 100%; box-sizing: border-box; padding: 6px; margin-top: 4px;
+    font-family: inherit; font-size: 13px;
+  }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  button {
+    padding: 7px 14px; cursor: pointer; border: 1px solid #ccc;
+    border-radius: 4px; background: #f5f5f5;
+  }
+  #preview {
+    margin-top: 10px; max-width: 100%; max-height: 160px;
+    border: 1px solid #ccc; display: none; background: #fafafa;
+  }
+  #err { color: #b00020; margin-top: 8px; min-height: 16px; }
+  #saveBtn { background: #0d6efd; color: #fff; border: none; }
+  #saveBtn:disabled { background: #9db8e8; cursor: not-allowed; }
+</style>
+</head>
+<body>
+  <h2>Dán ảnh vân tay thủ công</h2>
+
+  <div class="warn">
+    Chế độ này sẽ <b>ngắt kết nối máy quét thật</b>. Ảnh nhập ở đây được trả về
+    ngay cho lần gọi kế tiếp của <code>/api/finger/send-scan</code> (dùng 1 lần
+    rồi tự xoá). Kết quả trả về sẽ được đánh dấu rõ là nhập thủ công
+    (<code>SOURCE: MANUAL_UPLOAD</code>), không làm giả thành dữ liệu quét
+    thật. Chỉ dùng khi HS thao tác sai và bệnh nhân đã rời đi — bắt buộc ghi
+    rõ lý do để tra soát sau này.
+  </div>
+
+  <div class="row">
+    <button id="pasteBtn">Dán ảnh từ Clipboard</button>
+    <button id="fileBtn">Chọn file ảnh...</button>
+  </div>
+  <img id="preview" alt="preview" />
+
+  <label for="reason">Lý do lấy ảnh vân tay thủ công (bắt buộc)</label>
+  <textarea id="reason" rows="2" placeholder="VD: HS quên quét lúc khám, BN đã về"></textarea>
+
+  <div id="err"></div>
+
+  <div class="row" style="margin-top: 18px; justify-content: flex-end;">
+    <button id="cancelBtn">Huỷ</button>
+    <button id="saveBtn" disabled>Lưu ảnh này</button>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    let currentBase64 = null;
+    const preview = document.getElementById('preview');
+    const err = document.getElementById('err');
+    const saveBtn = document.getElementById('saveBtn');
+    const reasonEl = document.getElementById('reason');
+
+    function setImage(base64) {
+      currentBase64 = base64;
+      preview.src = 'data:image/png;base64,' + base64;
+      preview.style.display = 'block';
+      updateSaveEnabled();
+    }
+
+    function updateSaveEnabled() {
+      saveBtn.disabled = !(currentBase64 && reasonEl.value.trim());
+    }
+
+    reasonEl.addEventListener('input', updateSaveEnabled);
+
+    document.getElementById('pasteBtn').addEventListener('click', async () => {
+      err.textContent = '';
+      const res = await ipcRenderer.invoke('manual-image:read-clipboard');
+      if (!res.ok) {
+        err.textContent = res.message;
+        return;
+      }
+      setImage(res.base64);
+    });
+
+    document.getElementById('fileBtn').addEventListener('click', async () => {
+      err.textContent = '';
+      const res = await ipcRenderer.invoke('manual-image:pick-file');
+      if (!res.ok) {
+        if (!res.canceled) err.textContent = res.message;
+        return;
+      }
+      setImage(res.base64);
+    });
+
+    document.getElementById('cancelBtn').addEventListener('click', () => {
+      window.close();
+    });
+
+    saveBtn.addEventListener('click', async () => {
+      err.textContent = '';
+      saveBtn.disabled = true;
+      const res = await ipcRenderer.invoke('manual-image:save', {
+        base64: currentBase64,
+        reason: reasonEl.value
+      });
+      if (!res.ok) {
+        err.textContent = res.message;
+        saveBtn.disabled = false;
+        return;
+      }
+      window.close();
+    });
+  </script>
+</body>
+</html>

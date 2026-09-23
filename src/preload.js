@@ -3,6 +3,7 @@ contextBridge.exposeInMainWorld('printerAPI', {
   choosePdf: () => ipcRenderer.invoke('choose-pdf'),
   getPathForFile: file => webUtils.getPathForFile(file),
   getPrinters: () => ipcRenderer.invoke('printers'),
+  getPrinterDuplexCapability: printerName => ipcRenderer.invoke('printer-duplex-capability', printerName),
   print: options => ipcRenderer.invoke('print-pdf', options),
   createPreview: options => ipcRenderer.invoke('create-preview', options),
   generatePreview: request => ipcRenderer.invoke('generate-job-preview', request),

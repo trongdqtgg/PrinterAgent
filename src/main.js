@@ -1,13 +1,19 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Tray } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Tray, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs/promises');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const { autoUpdater } = require('electron-updater');
 const express = require('express');
 const multer = require('multer');
 const { print } = require('pdf-to-printer');
 const { PDFDocument } = require('pdf-lib');
 const { printDocument, isSupported } = require('./document-pipeline');
+// Tính năng bổ sung trên khay hệ thống (giữ nguyên code của 2 dự án gốc)
+const fingerprint = require('./fingerprint');
+const scanMobile = require('./scan-mobile/main');
+const execFileAsync = promisify(execFile);
 
 const LOCAL_HOST = '127.0.0.1';
 const LOCAL_PORT = 5756;
@@ -27,9 +33,28 @@ let tray;
 let isQuitting = false;
 let backgroundNoticeShown = false;
 let printerCache={items:[],expiresAt:0};
+const duplexCapabilityCache=new Map();
 let printQueue=Promise.resolve();
 const printJobs=new Map();
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
+const APP_URL = `http://${LOCAL_HOST}:${LOCAL_PORT}`;
+
+// Nhiều máy trạm dùng driver đồ họa cũ: tiến trình GPU của Chromium bị reset
+// (sau sleep/khóa màn hình, đổi màn hình...) làm cửa sổ kiosk trắng trơn.
+// Render bằng phần mềm ổn định hơn cho form in. Đặt A4A5_ENABLE_GPU=1 để bật lại GPU.
+if (process.env.A4A5_ENABLE_GPU !== '1') app.disableHardwareAcceleration();
+
+// Trạng thái auto update chạy ngầm
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+let updateCheckInProgress = false;
+let updateCheckManual = false;
+let pendingUpdateVersion = null;
+let installScheduled = false;
+
+// Trạng thái tự phục hồi form khi renderer bị trắng/crash
+let activeUiJobId = null;
+let recoverHistory = [];
+let unresponsiveTimer = null;
 
 const PAGE_SIZES_PT={A4:{width:595.28,height:841.89},A5:{width:419.53,height:595.28},Letter:{width:612,height:792}};
 const PREVIEW_MARGIN_PT=14.17;
@@ -38,7 +63,7 @@ async function reflowPdf(sourceBytes,{landscape,pageSize,scaleFactor}) {
   const srcDoc=await PDFDocument.load(sourceBytes); const outDoc=await PDFDocument.create();
   const base=PAGE_SIZES_PT[pageSize]||PAGE_SIZES_PT.A4;
   let targetW=base.width,targetH=base.height;if(landscape)[targetW,targetH]=[targetH,targetW];
-  const userScale=Math.min(2,Math.max(.5,(Number(scaleFactor)||100)/100));
+  const userScale=Math.min(2,Math.max(.5,(Number(scaleFactor)||95)/100));
   const pages=await outDoc.copyPages(srcDoc,srcDoc.getPageIndices());
   for(const page of pages){outDoc.addPage(page);const size=page.getSize();const scale=Math.min((targetW-PREVIEW_MARGIN_PT*2)/size.width,(targetH-PREVIEW_MARGIN_PT*2)/size.height)*userScale;page.scale(scale,scale);const x=(targetW-size.width*scale)/2,y=(targetH-size.height*scale)/2;page.setMediaBox(-x,-y,targetW,targetH);page.setCropBox(-x,-y,targetW,targetH);}
   return outDoc.save();
@@ -54,7 +79,7 @@ function selectedPageIndices(total,selection={}) {
 async function applyPageSelection(bytes,selection){const source=await PDFDocument.load(bytes);const indices=selectedPageIndices(source.getPageCount(),selection);if(!indices.length)throw new Error('Không có trang hợp lệ trong lựa chọn hiện tại');if(indices.length===source.getPageCount()&&(selection.mode||'all')==='all')return bytes;const out=await PDFDocument.create();const pages=await out.copyPages(source,indices);pages.forEach(p=>out.addPage(p));return out.save();}
 
 async function buildPreviewPdf(sourcePath,settings={}) {
-  const extension=path.extname(sourcePath).toLowerCase();const pageSize=PAGE_SIZES_PT[settings.pageSize]?settings.pageSize:'A4';const landscape=Boolean(settings.landscape);const scaleFactor=Math.min(200,Math.max(50,Number(settings.scaleFactor)||100));let bytes;
+  const extension=path.extname(sourcePath).toLowerCase();const pageSize=PAGE_SIZES_PT[settings.pageSize]?settings.pageSize:'A4';const landscape=Boolean(settings.landscape);const scaleFactor=Math.min(200,Math.max(50,Number(settings.scaleFactor)||95));let bytes;
   if(extension==='.pdf') bytes=await reflowPdf(await fs.readFile(sourcePath),{landscape,pageSize,scaleFactor});
   else {
     let html=await fs.readFile(sourcePath,'utf8');const dimensions={A4:['210mm','297mm'],A5:['148mm','210mm'],Letter:['8.5in','11in']}[pageSize];const width=landscape?dimensions[1]:dimensions[0],height=landscape?dimensions[0]:dimensions[1];const css=`<style>@page{size:${width} ${height};margin:5mm}@media print{html,body{margin:0!important;padding:0!important}body{zoom:${scaleFactor}%}}</style>`;html=html.includes('</head>')?html.replace('</head>',css+'</head>'):css+html;const tempHtml=path.join(app.getPath('temp'),`his-preview-${crypto.randomUUID()}.html`);await fs.writeFile(tempHtml,html,'utf8');const worker=new BrowserWindow({show:false,webPreferences:{javascript:true,contextIsolation:true,nodeIntegration:false}});try{await worker.loadFile(tempHtml);bytes=await worker.webContents.printToPDF({printBackground:true,landscape,pageSize,preferCSSPageSize:true});}finally{if(!worker.isDestroyed())worker.destroy();try{await fs.unlink(tempHtml);}catch{}}}
@@ -64,9 +89,27 @@ async function buildPreviewPdf(sourcePath,settings={}) {
 async function getPrintersCached(force=false) {
   const now=Date.now();
   if (!force && printerCache.items.length && printerCache.expiresAt > now) return printerCache.items;
+  if (!mainWindow || mainWindow.isDestroyed()) return printerCache.items;
   const items=await mainWindow.webContents.getPrintersAsync();
   printerCache={items,expiresAt:now+30000};
   return items;
+}
+
+async function getPrinterDuplexCapability(printerName) {
+  const name=String(printerName||'').trim();
+  if (!name) return {found:false,supported:null,message:'Chưa chọn máy in'};
+  if (duplexCapabilityCache.has(name)) return duplexCapabilityCache.get(name);
+  if (process.platform !== 'win32') return {found:false,supported:null,message:'Chỉ kiểm tra duplex trên Windows'};
+  const script=`$name=$args[0]; $printer=Get-CimInstance Win32_Printer | Where-Object { $_.Name -eq $name } | Select-Object -First 1; if ($null -eq $printer) { @{found=$false;supported=$null} | ConvertTo-Json -Compress; exit }; $caps=@($printer.Capabilities); $known=$null -ne $printer.Capabilities; @{found=$true;supported=$(if($known){$caps -contains 3}else{$null})} | ConvertTo-Json -Compress`;
+  try {
+    const {stdout}=await execFileAsync('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command',script,name],{windowsHide:true,timeout:10000,maxBuffer:1024*1024});
+    const parsed=JSON.parse(String(stdout||'{}').trim()||'{}');
+    const result={found:Boolean(parsed.found),supported:typeof parsed.supported==='boolean'?parsed.supported:null};
+    duplexCapabilityCache.set(name,result);
+    return result;
+  } catch (error) {
+    return {found:false,supported:null,message:`Không kiểm tra được duplex: ${error.message}`};
+  }
 }
 
 async function warmPrintEngine() {
@@ -78,28 +121,37 @@ async function warmPrintEngine() {
   await fs.readFile(executable);
 }
 
-function createWindow() {
+function createWindow({ show = true } = {}) {
   const appIcon = path.join(__dirname, 'assets', 'logo-vnpt.png');
-  mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     width: 980, height: 720, minWidth: 820, minHeight: 620,
     title: 'HIS Print Preview Pro',
     icon: appIcon,
+    show,
     frame: false,
     kiosk: true,
     minimizable: false,
     maximizable: false,
     closable: false,
     alwaysOnTop: true,
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false }
+    backgroundColor: '#f8fcff',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      // Cửa sổ bị ẩn nhiều giờ vẫn phải vẽ lại ngay khi HIS gọi in
+      backgroundThrottling: false
+    }
   });
-  mainWindow.setMenuBarVisibility(false);
-  mainWindow.setKiosk(true);
-  mainWindow.setAlwaysOnTop(true, 'screen-saver');
-  mainWindow.loadURL(`http://${LOCAL_HOST}:${LOCAL_PORT}`);
-  mainWindow.on('close', event => {
+  mainWindow = win;
+  win.setMenuBarVisibility(false);
+  win.setKiosk(true);
+  win.setAlwaysOnTop(true, 'screen-saver');
+  win.loadURL(APP_URL).catch(() => {});
+  win.on('close', event => {
     if (isQuitting) return;
     event.preventDefault();
-    mainWindow.hide();
+    win.hide();
     if (!backgroundNoticeShown && tray && process.platform === 'win32') {
       backgroundNoticeShown = true;
       tray.displayBalloon({
@@ -110,14 +162,106 @@ function createWindow() {
       });
     }
   });
-  mainWindow.webContents.once('did-finish-load', () => {
-    mainWindow.webContents.send('app-version', app.getVersion());
+  win.on('hide', () => scheduleInstallIfIdle(1500));
+  attachRendererRecovery(win);
+
+  let firstLoad = true;
+  // Dùng `on` thay vì `once`: sau khi form được nạp lại (tự phục hồi) vẫn phải
+  // gửi lại phiên bản và tài liệu HIS đang chờ, nếu không form sẽ trống.
+  win.webContents.on('did-finish-load', () => {
+    if (win.isDestroyed()) return;
+    win.webContents.send('app-version', app.getVersion());
+    resendActiveJob(win);
+    if (!firstLoad) return;
+    firstLoad = false;
     // Warm the printer cache while the UI is becoming ready so the first API
     // print does not have to wait for Windows to enumerate all drivers.
     getPrintersCached(true).catch(() => {});
     warmPrintEngine().catch(() => {});
-    setTimeout(configureAutoUpdate, 3000);
   });
+  return win;
+}
+
+function resendActiveJob(win) {
+  if (!activeUiJobId) return;
+  const job = printJobs.get(activeUiJobId);
+  if (!job || !['awaiting_preview','awaiting_confirmation'].includes(job.status)) { activeUiJobId = null; return; }
+  // Bản xem trước cũ gắn với phiên renderer trước; buộc tạo lại.
+  if (job.status === 'awaiting_confirmation') { job.status = 'awaiting_preview'; job.previewReady = false; }
+  win.webContents.send('incoming-document', publicPrintJob(job));
+}
+
+// ---------------------------------------------------------------------------
+// Tự phục hồi khi form bị trắng (renderer crash, GPU reset, nạp trang lỗi...)
+// ---------------------------------------------------------------------------
+function attachRendererRecovery(win) {
+  const wc = win.webContents;
+  wc.on('render-process-gone', (_event, details) => {
+    if (isQuitting) return;
+    console.warn(`Renderer của form in bị dừng: ${details.reason} (${details.exitCode})`);
+    setTimeout(() => recoverMainWindow(`render-process-gone:${details.reason}`), 500);
+  });
+  wc.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    // Bỏ qua lỗi của iframe xem trước PDF và lỗi -3 (điều hướng bị hủy)
+    if (!isMainFrame || errorCode === -3 || isQuitting) return;
+    console.warn(`Không nạp được form (${errorCode} ${errorDescription}) ${validatedURL}`);
+    setTimeout(() => recoverMainWindow(`did-fail-load:${errorCode}`), 1500);
+  });
+  win.on('unresponsive', () => {
+    if (unresponsiveTimer) return;
+    // Cho renderer 10 giây để tự hồi; quá thời gian thì nạp lại form
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null;
+      if (win.isDestroyed()) return;
+      try { wc.forcefullyCrashRenderer(); } catch {}
+      recoverMainWindow('unresponsive');
+    }, 10000);
+  });
+  win.on('responsive', () => {
+    if (unresponsiveTimer) { clearTimeout(unresponsiveTimer); unresponsiveTimer = null; }
+  });
+}
+
+function recoverMainWindow(reason) {
+  if (isQuitting) return;
+  if (!mainWindow || mainWindow.isDestroyed()) { createWindow({ show:false }); return; }
+  const now = Date.now();
+  recoverHistory = recoverHistory.filter(time => now - time < 60000);
+  recoverHistory.push(now);
+  console.warn(`Đang phục hồi form in (${reason}), lần ${recoverHistory.length} trong 1 phút`);
+  if (recoverHistory.length > 3) {
+    // Nạp lại nhiều lần vẫn lỗi: hủy hẳn cửa sổ và tạo cửa sổ mới
+    recoverHistory = [];
+    const old = mainWindow;
+    const wasVisible = old.isVisible();
+    old.removeAllListeners('close');
+    old.removeAllListeners('hide');
+    mainWindow = null;
+    old.destroy();
+    createWindow({ show:wasVisible });
+    return;
+  }
+  mainWindow.loadURL(APP_URL).catch(() => {});
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((_resolve, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
+}
+
+// Kiểm tra form có thực sự hiển thị các nút thao tác hay không
+async function ensureRendererHealthy() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const wc = mainWindow.webContents;
+  if (wc.isCrashed()) return recoverMainWindow('crashed');
+  if (wc.isLoading()) return;
+  try {
+    const healthy = await withTimeout(wc.executeJavaScript(
+      "Boolean(document.body && document.getElementById('print') && document.getElementById('previewButton') && document.getElementById('exitForm') && window.printerAPI)", true), 4000);
+    if (!healthy) recoverMainWindow('ui-missing');
+    else wc.invalidate();
+  } catch {
+    recoverMainWindow('health-timeout');
+  }
 }
 
 function showMainWindow() {
@@ -130,6 +274,13 @@ function showMainWindow() {
   mainWindow.setAlwaysOnTop(true, 'screen-saver');
   mainWindow.show();
   mainWindow.focus();
+  // Buộc vẽ lại sau thời gian dài ẩn và kiểm tra form còn nguyên vẹn
+  mainWindow.webContents.invalidate();
+  ensureRendererHealthy().catch(() => {});
+}
+
+function hideMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) mainWindow.hide();
 }
 
 function createTray() {
@@ -137,13 +288,22 @@ function createTray() {
   const icon = nativeImage.createFromPath(path.join(__dirname, 'assets', 'logo-vnpt.png')).resize({width:20,height:20});
   tray = new Tray(icon);
   tray.setToolTip(`A4 A5 Printer v${app.getVersion()} · API 127.0.0.1:${LOCAL_PORT}`);
+  refreshTrayMenu();
+  tray.on('click',showMainWindow);
+}
+
+function refreshTrayMenu() {
+  if (!tray || tray.isDestroyed()) return;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label:'Mở A4 A5 Printer', click:showMainWindow },
-    { label:'Kiểm tra cập nhật', click:() => { showMainWindow(); configureAutoUpdate(true); } },
     { type:'separator' },
-    { label:'Thoát hoàn toàn', click:() => { isQuitting=true; app.quit(); } }
+    { label:'📱 Scan mobile (chụp ảnh từ điện thoại)', click:() => { hideMainWindow(); scanMobile.openScanMobile().catch(error => console.error('Scan mobile:', error)); } },
+    { label:'👆 Quét vân tay', submenu:fingerprint.buildFingerprintMenu({ beforeOpenWindow:hideMainWindow }) },
+    { type:'separator' },
+    { label:'Kiểm tra cập nhật', click:() => startBackgroundUpdateCheck(true) },
+    { type:'separator' },
+    { label:'Thoát hoàn toàn', click:() => { isQuitting=true; if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setClosable(true); app.quit(); } }
   ]));
-  tray.on('click',showMainWindow);
 }
 
 function configureWindowsAutoStart() {
@@ -170,9 +330,31 @@ if (!gotSingleInstanceLock) {
     await startLocalServer();
     createTray();
     createWindow();
+    // Dịch vụ vân tay (API 127.0.0.1:18622) chạy nền cùng PrintAgent
+    fingerprint.startFingerprintService({ onChange:refreshTrayMenu }).catch(error => console.error('Fingerprint:', error));
+    // Auto update chạy ngầm: không phụ thuộc form, kiểm tra khi khởi động và định kỳ
+    setTimeout(() => startBackgroundUpdateCheck(false), 5000);
+    setInterval(() => startBackgroundUpdateCheck(false), UPDATE_INTERVAL_MS).unref();
+    // Sau sleep/khóa máy, kiểm tra lại form để không bị trắng khi mở ra
+    powerMonitor.on('resume', () => setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) ensureRendererHealthy().catch(() => {});
+    }, 2000));
+    powerMonitor.on('unlock-screen', () => {
+      if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) ensureRendererHealthy().catch(() => {});
+    });
   });
 }
+app.on('child-process-gone', (_event, details) => {
+  if (isQuitting || details.type !== 'GPU') return;
+  console.warn(`Tiến trình GPU bị dừng: ${details.reason}`);
+  setTimeout(() => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.invalidate();
+    if (mainWindow.isVisible()) ensureRendererHealthy().catch(() => {});
+  }, 1500);
+});
 app.on('before-quit', () => { isQuitting=true; });
+app.on('will-quit', () => { fingerprint.stopFingerprintService().catch(() => {}); });
 app.on('window-all-closed', () => {
   if (process.platform === 'darwin') return;
   if (!tray) app.quit();
@@ -189,32 +371,121 @@ ipcMain.handle('choose-pdf', async () => {
 });
 
 ipcMain.handle('printers', async () => getPrintersCached(true));
+ipcMain.handle('printer-duplex-capability', (_event, printerName) => getPrinterDuplexCapability(printerName));
 function sendUpdateStatus(type, message, percent) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update-status', { type, message, percent });
 }
 
+// ---------------------------------------------------------------------------
+// Auto update chạy ngầm
+// - Khi người dùng bấm "Kiểm tra cập nhật": đóng (ẩn) form in, kiểm tra/tải ngầm,
+//   báo tiến trình bằng thông báo khay hệ thống.
+// - Không bật hộp thoại modal lên cửa sổ kiosk (hộp thoại bị che phía sau cửa sổ
+//   luôn-trên-cùng, khóa toàn bộ form -> không bấm được nút nào).
+// - Tải xong: tự cài im lặng khi form đang ẩn và không có lệnh in đang chạy;
+//   nếu người dùng đang thao tác thì chờ tới khi đóng form rồi mới cài.
+// ---------------------------------------------------------------------------
+function notifyTray(title, content) {
+  if (tray && !tray.isDestroyed() && process.platform === 'win32') {
+    try { tray.displayBalloon({ title, content, iconType:'info', noSound:true }); } catch {}
+  }
+}
+
+function startBackgroundUpdateCheck(manual = false) {
+  if (manual) hideMainWindow();
+  configureAutoUpdate(manual).catch(() => {});
+  return { ok:true, background:true };
+}
+
 async function configureAutoUpdate(manual = false) {
   if (!app.isPackaged) {
-    if (manual) sendUpdateStatus('info', 'Auto update chỉ hoạt động trên bản đã đóng gói .exe.');
+    if (manual) {
+      sendUpdateStatus('info', 'Auto update chỉ hoạt động trên bản đã đóng gói .exe.');
+      notifyTray('A4 A5 Printer', 'Auto update chỉ hoạt động trên bản đã đóng gói .exe.');
+    }
     return;
   }
+  if (manual) updateCheckManual = true;
+  if (pendingUpdateVersion) {
+    if (manual) notifyTray('A4 A5 Printer', `Phiên bản ${pendingUpdateVersion} đã tải xong, sẽ tự cài khi không có lệnh in.`);
+    scheduleInstallIfIdle(1000);
+    return;
+  }
+  if (updateCheckInProgress) {
+    if (manual) notifyTray('A4 A5 Printer', 'Đang kiểm tra/tải bản cập nhật trong nền...');
+    return;
+  }
+  updateCheckInProgress = true;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
   sendUpdateStatus('checking', 'Đang kiểm tra bản cập nhật...');
+  if (manual) notifyTray('A4 A5 Printer', 'Đang kiểm tra bản cập nhật trong nền. Form in đã được đóng.');
   try { await autoUpdater.checkForUpdates(); }
-  catch (error) { sendUpdateStatus('error', `Không kiểm tra được cập nhật: ${error.message}`); }
+  catch (error) {
+    updateCheckInProgress = false;
+    sendUpdateStatus('error', `Không kiểm tra được cập nhật: ${error.message}`);
+    if (updateCheckManual) notifyTray('Không kiểm tra được cập nhật', error.message);
+    updateCheckManual = false;
+  }
 }
 
-autoUpdater.on('update-available', info => sendUpdateStatus('downloading', `Đang tải phiên bản ${info.version}...`, 0));
-autoUpdater.on('update-not-available', () => sendUpdateStatus('ok', 'Bạn đang dùng phiên bản mới nhất.'));
-autoUpdater.on('download-progress', p => sendUpdateStatus('downloading', `Đang tải cập nhật ${Math.round(p.percent)}%`, Math.round(p.percent)));
-autoUpdater.on('update-downloaded', async info => {
-  sendUpdateStatus('ready', `Phiên bản ${info.version} đã sẵn sàng.`);
-  const result = await dialog.showMessageBox(mainWindow, { type:'info', buttons:['Khởi động lại và cập nhật','Để sau'], defaultId:0, cancelId:1, title:'Có bản cập nhật', message:`Đã tải xong phiên bản ${info.version}.`, detail:'Ứng dụng sẽ khởi động lại để hoàn tất cập nhật.' });
-  if (result.response === 0) autoUpdater.quitAndInstall(false, true);
+function hasBusyPrintJob() {
+  for (const job of printJobs.values()) if (['queued','processing'].includes(job.status)) return true;
+  return false;
+}
+
+function scheduleInstallIfIdle(delay = 3000) {
+  if (!pendingUpdateVersion || installScheduled || isQuitting) return;
+  installScheduled = true;
+  setTimeout(() => {
+    installScheduled = false;
+    if (!pendingUpdateVersion || isQuitting) return;
+    const formVisible = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible();
+    // Không tự cài khi đang in, đang chờ quét vân tay hoặc đang mở Scan mobile
+    if (formVisible || hasBusyPrintJob() || fingerprint.isFingerprintBusy() || scanMobile.isScanMobileVisible()) {
+      // Người dùng đang thao tác/in: thử lại sau, sự kiện 'hide' cũng sẽ kích hoạt lại
+      setTimeout(() => scheduleInstallIfIdle(0), 60000).unref();
+      return;
+    }
+    installDownloadedUpdate();
+  }, delay).unref();
+}
+
+function installDownloadedUpdate() {
+  sendUpdateStatus('installing', `Đang cài phiên bản ${pendingUpdateVersion}...`);
+  isQuitting = true;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setClosable(true);
+  if (tray && !tray.isDestroyed()) { tray.destroy(); tray = null; }
+  // isSilent=true: cài ngầm không hiện trình cài NSIS; isForceRunAfter=true: tự mở lại agent
+  setImmediate(() => autoUpdater.quitAndInstall(true, true));
+}
+
+autoUpdater.on('update-available', info => {
+  sendUpdateStatus('downloading', `Đang tải phiên bản ${info.version}...`, 0);
+  if (updateCheckManual) notifyTray('Có bản cập nhật mới', `Đang tải phiên bản ${info.version} trong nền...`);
 });
-autoUpdater.on('error', error => sendUpdateStatus('error', `Lỗi cập nhật: ${error.message}`));
-ipcMain.handle('check-update', () => configureAutoUpdate(true));
+autoUpdater.on('update-not-available', () => {
+  updateCheckInProgress = false;
+  sendUpdateStatus('ok', 'Bạn đang dùng phiên bản mới nhất.');
+  if (updateCheckManual) notifyTray('A4 A5 Printer', `Bạn đang dùng phiên bản mới nhất (v${app.getVersion()}).`);
+  updateCheckManual = false;
+});
+autoUpdater.on('download-progress', p => sendUpdateStatus('downloading', `Đang tải cập nhật ${Math.round(p.percent)}%`, Math.round(p.percent)));
+autoUpdater.on('update-downloaded', info => {
+  updateCheckInProgress = false;
+  updateCheckManual = false;
+  pendingUpdateVersion = info.version;
+  sendUpdateStatus('ready', `Phiên bản ${info.version} đã sẵn sàng, sẽ tự cài khi không có lệnh in.`);
+  notifyTray('Đã tải xong bản cập nhật', `Phiên bản ${info.version} sẽ tự cài đặt ngầm khi form in đóng và không có lệnh in.`);
+  scheduleInstallIfIdle(3000);
+});
+autoUpdater.on('error', error => {
+  updateCheckInProgress = false;
+  sendUpdateStatus('error', `Lỗi cập nhật: ${error.message}`);
+  if (updateCheckManual) notifyTray('Lỗi cập nhật', error.message);
+  updateCheckManual = false;
+});
+ipcMain.handle('check-update', () => startBackgroundUpdateCheck(true));
 
 function sendPrintProgress(message) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('print-progress', message);
@@ -244,7 +515,8 @@ async function executeDirectPdfPrint(options,onProgress=sendPrintProgress) {
     } finally { if (!worker.isDestroyed()) worker.destroy(); }
   } else if (extension !== '.pdf') return {ok:false,error:'Chỉ hỗ trợ PDF, HTML hoặc HTM'};
   onProgress('Đang gửi tài liệu tới Windows Print Spooler...');
-  try { await print(printablePath,{printer:options.deviceName,copies:Number(options.copies)||1,scale:'noscale',silent:true}); }
+  const side=['duplex','duplexshort','duplexlong'].includes(options.duplexMode)?options.duplexMode:'simplex';
+  try { await print(printablePath,{printer:options.deviceName,copies:Number(options.copies)||1,scale:'noscale',side,silent:true}); }
   finally { if (generatedPdf) { try { await fs.unlink(generatedPdf); } catch {} } }
   return {ok:true,direct:true,durationMs:Date.now()-startedAt};
 }
@@ -323,6 +595,7 @@ function createPreviewJob(filePath,metadata={}) {
   const jobId=crypto.randomUUID();
   const job={jobId,status:'awaiting_preview',message:'Đang chờ tạo bản xem trước',progress:'Hãy bấm Xem trước thực tế',createdAt:new Date().toISOString(),submittedToSpooler:false,filePath,previewReady:false,previewPath:null,...metadata};
   printJobs.set(jobId,job);
+  activeUiJobId=jobId;
   showMainWindow();
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('incoming-document',publicPrintJob(job));
   return job;
@@ -364,8 +637,17 @@ ipcMain.handle('confirm-preview', async (_event, options) => {
   const job=printJobs.get(options.jobId);
   if (!job || job.status !== 'awaiting_confirmation' || !job.previewReady || !job.previewPath) throw new Error('Phải tạo và kiểm tra bản xem trước trước khi in');
   if (String(options.signature||'') !== String(job.previewSignature||'')) throw new Error('Cấu hình đã thay đổi; vui lòng xem trước lại');
-  enqueuePrintJob({filePath:job.previewPath,deviceName:options.deviceName||job.deviceName,copies:Number(options.copies)||job.copies||1},{deviceName:options.deviceName||job.deviceName,copies:Number(options.copies)||job.copies||1,originalName:job.originalName,localFile:job.localFile,sourceFilePath:job.filePath},job);
-  return await job.completion;
+  const requestedDuplex=['duplex','duplexshort','duplexlong'].includes(options.duplexMode)?options.duplexMode:'simplex';
+  let duplexMode='simplex';
+  if (requestedDuplex!=='simplex') {
+    if ((job.previewSettings&&job.previewSettings.pageSelection&&job.previewSettings.pageSelection.mode)!=='all') throw new Error('In hai mặt chỉ áp dụng khi chọn Tất cả trang');
+    duplexMode=requestedDuplex;
+  }
+  const queuedJob=enqueuePrintJob({filePath:job.previewPath,deviceName:options.deviceName||job.deviceName,copies:Number(options.copies)||job.copies||1,duplexMode},{deviceName:options.deviceName||job.deviceName,copies:Number(options.copies)||job.copies||1,duplexMode,originalName:job.originalName,localFile:job.localFile,sourceFilePath:job.filePath},job);
+  const completed=await queuedJob.completion;
+  if (completed.status==='failed') throw new Error(completed.error||'Lệnh in không hoàn tất');
+  if (completed.status!=='awaiting_preview') throw new Error('Tác vụ in chưa sẵn sàng để xem trước lần tiếp theo');
+  return completed;
 });
 ipcMain.handle('exit-form', () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide(); return {ok:true}; });
 ipcMain.handle('export-preview-pdf', async (_event, jobId) => {
@@ -381,6 +663,7 @@ ipcMain.handle('cancel-preview', async (_event, jobId) => {
   const job=printJobs.get(jobId);
   if (!job || !['awaiting_preview','awaiting_confirmation'].includes(job.status)) return {ok:false};
   job.status='cancelled'; job.message='Đã hủy lệnh in'; job.finishedAt=new Date().toISOString();
+  if (activeUiJobId===jobId) activeUiJobId=null;
   if (job.previewPath && job.previewPath !== job.filePath) { try { await fs.unlink(job.previewPath); } catch {} }
   if (!job.localFile) { try { await fs.unlink(job.filePath); } catch {} }
   return {ok:true};
@@ -438,8 +721,8 @@ async function startLocalServer() {
     catch (error) { res.status(500).json({ ok:false, error:error.message }); }
   });
   web.post('/api/update', async (_req, res) => {
-    configureAutoUpdate(true);
-    res.json({ ok:true, message:'Đã bắt đầu kiểm tra cập nhật trên Print Agent.' });
+    startBackgroundUpdateCheck(true);
+    res.json({ ok:true, message:'Đã bắt đầu kiểm tra cập nhật ngầm trên Print Agent.' });
   });
   web.get('/api/print', (_req, res) => res.json({
     ok:true,
@@ -513,7 +796,7 @@ async function startLocalServer() {
         copies:copiesValue,
         pageSelection:pages,
         originalName:req.file.originalname,
-        initialSettings:{pageSize:targetSize||'A4',landscape:String(req.body.landscape||'false')==='true',scaleFactor:Number(req.body.scaleFactor)||100,pageSelection:{mode:pages,customRange:String(req.body.customRange||'')}}
+        initialSettings:{pageSize:targetSize||'A4',landscape:String(req.body.landscape||'false')==='true',scaleFactor:Number(req.body.scaleFactor)||95,pageSelection:{mode:pages,customRange:String(req.body.customRange||'')}}
       });
       handedOff=true;
       res.status(202).json({
